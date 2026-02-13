@@ -1,0 +1,9 @@
+chroma_db/chroma.sqlite3
+venv/Include/site/python3.11/greenlet/greenlet.h
+venv/Lib/
+venv/Lib/site-packages/_multiprocess/__init__.py
+venv/Scripts/accelerate-config.exe
+venv/Scripts/accelerate-merge-weights.exe
+venv/Scripts/activate.bat
+venv/*
+pdfs/*
