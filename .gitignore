@@ -7,3 +7,6 @@ venv/Scripts/accelerate-merge-weights.exe
 venv/Scripts/activate.bat
 venv/*
 pdfs/*
+chroma_db/
+debug_images/*
+debug_images.py
