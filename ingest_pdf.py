@@ -20,116 +20,168 @@ from docling_core.types.doc.document import TextItem, SectionHeaderItem
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# ──────────────────────────────────────────────────────
-# CONFIG — swap models here if you want to experiment
-# ──────────────────────────────────────────────────────
-VISION_MODEL   = "gemma3:4b"          # handles images
-TEXT_MODEL     = "deepseek-r1:8b"     # handles text/table reasoning
-EMBED_MODEL    = "mxbai-embed-large"   # handles embeddings
-CHROMA_PATH    = "./chroma_db"
-OLLAMA_URL     = "http://localhost:11434"
+# ── CONFIG ──────────────────────────────────────────────────────────────
+VISION_MODEL  = "gemma3:4b"
+TEXT_MODEL    = "deepseek-r1:8b"
+EMBED_MODEL   = "mxbai-embed-large"
+CHROMA_PATH   = "./chroma_db"
+OLLAMA_URL    = "http://localhost:11434"
 
-CHUNK_SIZE    = 400    # smaller = more precise retrieval
-CHUNK_OVERLAP = 80     # ~20% overlap to preserve context at boundaries
+CHUNK_SIZE    = 400
+CHUNK_OVERLAP = 80
 
-
-# Text fragments from Docling that are captions/noise, not real content
-JUNK_PHRASES = [
-    "here is the requested image",
-    "this is the table",
-    "<!-- image -->",
-    "figure ",
-    "table ",
-]
-
-# Minimum character length for a text item to be worth keeping
-MIN_TEXT_LENGTH = 20
-
-# Minimum image dimensions to skip icons/bullets/decorative elements
-MIN_IMAGE_WIDTH  = 100
-MIN_IMAGE_HEIGHT = 100
+MIN_IMAGE_WIDTH  = 150
+MIN_IMAGE_HEIGHT = 150
 
 
-# ──────────────────────────────────────────────────────
-# STEP 1: Describe images using gemma3:4b (vision model)
-# ──────────────────────────────────────────────────────
+# ── VISION HELPER ───────────────────────────────────────────────────────
+
 def describe_image(image_bytes: bytes, doc_context: str = "") -> str:
     """
-    Use gemma3:4b (vision) to convert an image into a rich text description.
-    Prompt is designed to handle UI screenshots, charts, diagrams, and photos.
+    Use gemma3:4b to describe an embedded image.
+    Only called for actual embedded image objects —
+    never for full page renders.
     """
-    prompt = f"""You are analyzing an image extracted from a PDF document.
-Document context: {doc_context[:400]}
-
-Analyze this image carefully. It could be any of the following:
-- A UI screenshot or application window  → transcribe ALL visible text exactly, describe every section, button, label
-- A chart or graph                       → describe axes, values, trends, title
-- A diagram                             → describe structure, labels, relationships
-- A photo or illustration               → describe what is shown in detail
-- A table rendered as an image          → extract ALL rows and columns as text
-
-Critical instructions:
-1. Transcribe ANY text visible in the image EXACTLY as it appears.
-2. Preserve all headings, labels, section names, and numerical values.
-3. Be exhaustive — your description is the ONLY way this image's content can be searched.
-4. Start directly with the content — do not say 'I can see an image of...'"""
-
     response = ollama.chat(
         model=VISION_MODEL,
         messages=[{
-            "role": "user",
-            "content": prompt,
+            "role":    "user",
+            "content": f"""Describe this image in detail.
+
+If it contains text: transcribe ALL of it exactly.
+If it is a UI screenshot: describe every section, panel, and label visible.
+If it is a chart: describe axes, values, and trends.
+If it is a table rendered as image: extract all rows and columns.
+Be thorough — this description is used for semantic search.""",
             "images": [image_bytes]
         }]
     )
     return response.message.content
 
 
-# ──────────────────────────────────────────────────────
-# STEP 2: Describe tables using deepseek-r1:8b
-# deepseek-r1 uses chain-of-thought reasoning, which is
-# excellent for understanding table structure and meaning.
-# We strip the <think> block from output for clean storage.
-# ──────────────────────────────────────────────────────
 def describe_table(table_markdown: str, doc_context: str = "") -> str:
     """
-    Use deepseek-r1:8b to produce a semantic, searchable description of a table.
-    Strip the <think> block — we only store the final answer.
+    Use deepseek-r1:8b to produce a semantic description of a table.
+    Strips <think> block, stores only the final answer.
     """
-    prompt = f"""You are analyzing a table extracted from a PDF document.
-Document context: {doc_context[:400]}
+    response = ollama.chat(
+        model=TEXT_MODEL,
+        messages=[{
+            "role": "user",
+            "content": f"""You are analyzing a table from a PDF document.
+Document context: {doc_context[:300]}
 
 Table (markdown):
 {table_markdown}
 
-Tasks:
 1. Write a 2-3 sentence plain-language summary of what this table represents.
-2. List each row as a natural language sentence (e.g. "Abc holds the role of Software Engineer.").
-3. Note any patterns, totals, or key observations.
+2. List each row as a natural language sentence.
+3. Note any patterns or key observations.
 
-Write in natural language — this will be used for semantic search."""
-
-    response = ollama.chat(
-        model=TEXT_MODEL,
-        messages=[{"role": "user", "content": prompt}]
+Write in natural language suitable for semantic search."""
+        }]
     )
     content = response.message.content
-    # Strip deepseek-r1's chain-of-thought block — keep only final answer
     if "</think>" in content:
         content = content.split("</think>")[-1].strip()
     return content
 
 
+# ── PAGE EXTRACTION (two-stage, no full-page render) ────────────────────
 
-# ──────────────────────────────────────────────────────
-# STEP 3: Set up ChromaDB with Ollama embeddings
-# nomic-embed-text runs locally — no OpenAI calls at all
-# ──────────────────────────────────────────────────────
+def extract_page(page: fitz.Page, page_num: int, doc_context: str = "") -> dict:
+    """
+    Two-stage extraction per page:
+
+    Stage 1 — Free, instant, zero GPU:
+        PyMuPDF reads all native text and table structure directly
+        from the PDF's internal data. No AI needed.
+
+    Stage 2 — Only for actual embedded images:
+        Run vision model ONLY on specific embedded image objects.
+        Never renders or processes the full page as an image.
+
+    Returns dict with text, tables, images separately.
+    """
+    result = {
+        "page_num": page_num + 1,
+        "text":     "",
+        "tables":   [],
+        "images":   []
+    }
+
+    # ── STAGE 1a: Native text ─────────────────────────────────────────
+    native_text = page.get_text("text").strip()
+    if native_text:
+        result["text"] = native_text
+
+    # ── STAGE 1b: Native tables ───────────────────────────────────────
+    try:
+        tables = page.find_tables()
+        for table in tables:
+            df = table.to_pandas()
+            if not df.empty:
+                md_table = df.to_markdown(index=False)
+                result["tables"].append(md_table)
+    except Exception:
+        pass
+
+    # ── STAGE 2: Vision model only for embedded images ────────────────
+    doc        = page.parent
+    image_list = page.get_images(full=True)
+    seen       = set()
+
+    for img_info in image_list:
+        try:
+            xref        = img_info[0]
+            base_image  = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            width       = base_image.get("width",  0)
+            height      = base_image.get("height", 0)
+
+            if width < MIN_IMAGE_WIDTH or height < MIN_IMAGE_HEIGHT:
+                continue
+
+            img_hash = hashlib.md5(image_bytes).hexdigest()
+            if img_hash in seen:
+                continue
+            seen.add(img_hash)
+
+            description = describe_image(image_bytes, doc_context)
+            result["images"].append({
+                "width":       width,
+                "height":      height,
+                "description": description
+            })
+
+        except Exception as e:
+            print(f"     ⚠️  Image on page {page_num + 1}: {e}")
+
+    return result
+
+
+def format_page_content(page_data: dict) -> str:
+    """Combine text, tables, and image descriptions into one clean string."""
+    parts = [f"=== PAGE {page_data['page_num']} ==="]
+
+    if page_data["text"]:
+        parts.append(page_data["text"])
+
+    for i, table in enumerate(page_data["tables"]):
+        parts.append(f"\n[TABLE {i + 1}]\n{table}")
+
+    for i, img in enumerate(page_data["images"]):
+        parts.append(
+            f"\n[IMAGE {i + 1} — {img['width']}x{img['height']}px]\n"
+            f"{img['description']}"
+        )
+
+    return "\n\n".join(parts)
+
+
+# ── VECTOR STORE ─────────────────────────────────────────────────────────
+
 def get_vectorstore():
-    """
-    Returns a ChromaDB collection using mxbai-embed-large via Ollama.
-    Uses cosine similarity — best for text retrieval tasks.
-    """
     embedding_fn = OllamaEmbeddingFunction(
         model_name=EMBED_MODEL,
         url=f"{OLLAMA_URL}/api/embeddings"
@@ -143,35 +195,14 @@ def get_vectorstore():
     return collection
 
 
-# ──────────────────────────────────────────────────────
-# STEP 4: Configure Docling for layout-aware PDF parsing
-# ──────────────────────────────────────────────────────
-def get_converter():
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True
-    pipeline_options.do_table_structure = True
-    pipeline_options.images_scale = 2.0
-    pipeline_options.generate_picture_images = True
+# ── MAIN INGESTION ────────────────────────────────────────────────────────
 
-    format_option = PdfFormatOption(
-        pipeline_options=pipeline_options,
-        backend=PyPdfiumDocumentBackend  # correct backend
-    )
-
-    return DocumentConverter(
-        format_options={InputFormat.PDF: format_option}
-    )
-
-# ──────────────────────────────────────────────────────
-# STEP 5: Main ingestion pipeline
-# ──────────────────────────────────────────────────────
 def ingest_pdfs(pdf_dir: str = "./pdfs"):
-    converter    = get_converter()
-    collection   = get_vectorstore()
+    collection    = get_vectorstore()
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ".", " ", ""]  # respect sentence boundaries
+        separators=["\n\n", "\n", ".", " ", ""]
     )
 
     pdf_paths = list(Path(pdf_dir).glob("**/*.pdf"))
@@ -179,202 +210,97 @@ def ingest_pdfs(pdf_dir: str = "./pdfs"):
 
     for pdf_path in pdf_paths:
         print(f"📄 Processing: {pdf_path.name}")
-        result      = converter.convert(str(pdf_path))
-        doc         = result.document
-        doc_context = doc.export_to_markdown()[:2000]
-        source      = pdf_path.name
-        doc_title   = pdf_path.stem.replace("_", " ").replace("-", " ").title()
+        source    = pdf_path.name
+        doc_title = pdf_path.stem.replace("_", " ").replace("-", " ").title()
+
+        fitz_doc    = fitz.open(str(pdf_path))
+        doc_context = ""
+
+        # Build a quick doc context from first page native text
+        if len(fitz_doc) > 0:
+            doc_context = fitz_doc[0].get_text("text")[:1000] if len(fitz_doc) > 0 else ""
 
         all_ids, all_docs, all_metas = [], [], []
 
-        # ── A) TEXT ──────────────────────────────────────────────────────
-        # FIX: Extract ONLY pure text/heading items — skip table & image placeholders.
-        # Previously we used doc.export_to_markdown() which mixed everything together,
-        # causing <!-- image --> noise and raw table markdown to pollute text chunks.
-        print("  → Extracting clean text...")
-        text_only_parts = []
-
-        for item, _ in doc.iterate_items():
-            if isinstance(item, (TextItem, SectionHeaderItem)):
-                text = item.text.strip() if item.text else ""
-                if len(text) < MIN_TEXT_LENGTH:
-                    continue
-                if any(junk in text.lower() for junk in JUNK_PHRASES):
-                    continue
-                text_only_parts.append(text)
-
-        if text_only_parts:
-            text_content = "\n\n".join(text_only_parts)
-            chunks = text_splitter.split_text(text_content)
-            for i, chunk in enumerate(chunks):
-                contextualized = (
-                    f"Document: {doc_title}\n"
-                    f"Chunk {i + 1} of {len(chunks)}\n\n"
-                    f"{chunk}"
-                )
-                chunk_id = hashlib.md5(
-                    f"{source}-text-{i}".encode()
-                ).hexdigest()
-                all_ids.append(chunk_id)
-                all_docs.append(contextualized)
-                all_metas.append({
-                    "source":      source,
-                    "type":        "text",
-                    "chunk_index": i,
-                    "doc_title":   doc_title
-                })
-            print(f"     → {len(chunks)} text chunk(s)")
-        else:
-            print("     → No clean text found (image-only or caption-only PDF)")
-
-
-        # ── B) TABLES ────────────────────────────────────────────────────
-        # Use doc.tables (Docling's direct property) — avoids label-checking.
-        # Store BOTH the LLM semantic description AND the raw markdown table
-        # so the LLM at query time can access exact values if needed.
-        print(f"  → Processing {len(doc.tables)} table(s) with {TEXT_MODEL}...")
-        for i, table in enumerate(doc.tables):
-            try:
-                # Pass doc object — fixes deprecation warning
-                raw_table = table.export_to_markdown(doc)
-
-                description = describe_table(raw_table, doc_context)
-
-                # Store description + raw table together for best of both worlds:
-                # - Description helps with semantic/conceptual queries
-                # - Raw table helps with exact value lookups
-                combined = (
-                    f"Document: {doc_title}\n"
-                    f"TABLE {i + 1} SEMANTIC SUMMARY:\n{description}\n\n"
-                    f"RAW TABLE DATA:\n{raw_table}"
-                )
-                chunk_id = hashlib.md5(f"{source}-table-{i}".encode()).hexdigest()
-                all_ids.append(chunk_id)
-                all_docs.append(combined)
-                all_metas.append({
-                    "source":    source,
-                    "type":      "table",
-                    "table_index": i,
-                    "doc_title": doc_title,
-                    "raw":       raw_table      # available for exact retrieval
-                })
-                print(f"     → Table {i} processed")
-            except Exception as e:
-                print(f"     ⚠️  Skipped table {i}: {e}")
-
-        # ── C) IMAGES ────────────────────────────────────────────────────
-        # Use doc.pictures (Docling's direct property).
-        # IMPROVEMENT: Enhanced prompt captures UI screenshots, not just photos.
-        # The description becomes the searchable text for this image.
-        print(f"  → Processing {len(doc.pictures)} image(s) with {VISION_MODEL}...")
-        seen_hashes  = set()
-        image_count  = 0
-
-        for i, picture in enumerate(doc.pictures):
-            try:
-                pil_image = picture.get_image(doc)
-                if pil_image is None:
-                    continue
-
-                w, h = pil_image.size
-                if w < 800 or h < 800:
-                    scale  = max(800 / w, 800 / h)
-                    new_w  = int(w * scale)
-                    new_h  = int(h * scale)
-                    from PIL import Image as PILImage
-                    pil_image = pil_image.resize(
-                        (new_w, new_h),
-                        PILImage.Resampling.LANCZOS   # high-quality upscale
-                    )
-
-                buf = io.BytesIO()
-                pil_image.save(buf, format="PNG")
-                image_bytes = buf.getvalue()
-
-                img_hash = hashlib.md5(image_bytes).hexdigest()
-                seen_hashes.add(img_hash)
-
-                description = describe_image(image_bytes, doc_context)
-                chunk_id = hashlib.md5(
-                    f"{source}-image-{i}".encode()
-                ).hexdigest()
-                all_ids.append(chunk_id)
-                all_docs.append(
-                    f"Document: {doc_title}\n"
-                    f"IMAGE {i + 1} DESCRIPTION:\n{description}"
-                )
-                all_metas.append({
-                    "source":      source,
-                    "type":        "image",
-                    "image_index": i,
-                    "doc_title":   doc_title,
-                    "extractor":   "docling"
-                })
-                image_count += 1
-            except Exception as e:
-                print(f"     ⚠️  Skipped image {i}: {e}")
-
-        print(f"     → {image_count} image(s) via Docling")
-
-       # ── D) PAGE RENDER FALLBACK via PyMuPDF ───────────────────────────────
-        # Instead of extracting embedded image objects (which can miss screenshots),
-        # render each full PDF page as a high-res image and describe it.
-        # This is the most robust approach for PDFs with UI screenshots, diagrams,
-        # or any content that isn't a clean embedded image object.
-        print("  → Rendering full pages via PyMuPDF for complete visual coverage...")
-        fitz_doc       = fitz.open(str(pdf_path))
-        fallback_count = 0
-
         for page_num in range(len(fitz_doc)):
-            try:
-                page = fitz_doc[page_num]
+            print(f"  → Page {page_num + 1}/{len(fitz_doc)}")
+            page      = fitz_doc[page_num]
+            page_data = extract_page(page, page_num, doc_context)
 
-                # Render at 2x scale — balances quality vs. memory
-                # Increase to 3.0 for very dense pages (more detail for vision model)
-                mat = fitz.Matrix(2.0, 2.0)
-                pix = page.get_pixmap(matrix=mat, alpha=False)
+            has_text   = "✓ text"                            if page_data["text"]   else "✗ text"
+            has_tables = f"✓ {len(page_data['tables'])} table(s)" if page_data["tables"] else "✗ tables"
+            has_images = f"✓ {len(page_data['images'])} image(s)" if page_data["images"] else "✗ images"
+            print(f"     {has_text} | {has_tables} | {has_images}")
 
-                # Convert pixmap → PNG bytes
-                image_bytes = pix.tobytes("png")
+            # ── Text chunks ───────────────────────────────────────────
+            if page_data["text"]:
+                chunks = text_splitter.split_text(page_data["text"])
+                for i, chunk in enumerate(chunks):
+                    contextualized = (
+                        f"Document: {doc_title}\n"
+                        f"Page: {page_num + 1}\n"
+                        f"Chunk: {i + 1} of {len(chunks)}\n\n"
+                        f"{chunk}"
+                    )
+                    chunk_id = hashlib.md5(
+                        f"{source}-p{page_num}-text-{i}".encode()
+                    ).hexdigest()
+                    all_ids.append(chunk_id)
+                    all_docs.append(contextualized)
+                    all_metas.append({
+                        "source":    source,
+                        "type":      "text",
+                        "page":      page_num + 1,
+                        "doc_title": doc_title
+                    })
 
-                # Skip near-blank pages (mostly whitespace)
-                # A blank page compressed PNG is typically < 5KB
-                if len(image_bytes) < 5000:
-                    print(f"     → Page {page_num + 1} appears blank, skipping")
-                    continue
+            # ── Table chunks ──────────────────────────────────────────
+            for i, table_md in enumerate(page_data["tables"]):
+                try:
+                    description = describe_table(table_md, doc_context)
+                    combined    = (
+                        f"Document: {doc_title}\n"
+                        f"Page: {page_num + 1}\n"
+                        f"TABLE {i + 1} SUMMARY:\n{description}\n\n"
+                        f"RAW TABLE:\n{table_md}"
+                    )
+                    chunk_id = hashlib.md5(
+                        f"{source}-p{page_num}-table-{i}".encode()
+                    ).hexdigest()
+                    all_ids.append(chunk_id)
+                    all_docs.append(combined)
+                    all_metas.append({
+                        "source":    source,
+                        "type":      "table",
+                        "page":      page_num + 1,
+                        "doc_title": doc_title
+                    })
+                except Exception as e:
+                    print(f"     ⚠️  Table {i} on page {page_num + 1}: {e}")
 
-                description = describe_image(image_bytes, doc_context)
-
+            # ── Image chunks ──────────────────────────────────────────
+            for i, img in enumerate(page_data["images"]):
                 chunk_id = hashlib.md5(
-                    f"{source}-pagerender-p{page_num}".encode()
+                    f"{source}-p{page_num}-img-{i}".encode()
                 ).hexdigest()
                 all_ids.append(chunk_id)
                 all_docs.append(
                     f"Document: {doc_title}\n"
-                    f"FULL PAGE {page_num + 1} VISUAL DESCRIPTION:\n{description}"
+                    f"Page: {page_num + 1}\n"
+                    f"IMAGE {i + 1} ({img['width']}x{img['height']}px):\n"
+                    f"{img['description']}"
                 )
                 all_metas.append({
                     "source":    source,
                     "type":      "image",
                     "page":      page_num + 1,
-                    "doc_title": doc_title,
-                    "extractor": "pymupdf_pagerender"
+                    "doc_title": doc_title
                 })
-                fallback_count += 1
-                print(f"     → Page {page_num + 1} rendered and described")
-
-            except Exception as e:
-                print(f"     ⚠️  Failed to render page {page_num + 1}: {e}")
 
         fitz_doc.close()
-        print(f"     → {fallback_count} page render(s) added")
 
-        # ── E) UPSERT to ChromaDB ─────────────────────────────────────
         if all_docs:
-            print(
-                f"  → Embedding {len(all_docs)} total chunks "
-                f"with {EMBED_MODEL}..."
-            )
+            print(f"\n  → Embedding {len(all_docs)} chunk(s) with {EMBED_MODEL}...")
             collection.upsert(
                 ids=all_ids,
                 documents=all_docs,
