@@ -281,15 +281,19 @@ def answer_direct(pdf_path: str, question: str) -> str:
         model=TEXT_MODEL,
         messages=[{
             "role": "user",
-            "content": f"""You have been given the complete content of a PDF document.
-Answer the question using ONLY this content.
-If the answer is not present, say so clearly.
+            "content": f"""You are a helpful assistant. A user is asking a question 
+about a PDF document.
+
+First check if the answer is present in the document content below.
+
+- If YES: answer using the document content and cite it.
+- If NO:  answer from your general knowledge and clearly state
+          "This is not in the document, but generally speaking..."
 
 DOCUMENT CONTENT:
 {full_content}
 
 QUESTION: {question}
-
 Answer:"""
         }]
     )

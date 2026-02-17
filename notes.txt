@@ -1,0 +1,15 @@
+How Modern LLM Chats handle context:
+
+What you think happens:
+  Turn 1: [Your message] → Model answers
+  Turn 2: [Your message] → Model remembers Turn 1
+
+What actually happens every single time:
+  Turn 1: [System prompt + Your message] → Model answers
+  Turn 2: [System prompt + Turn 1 Q + Turn 1 A + Your message] → Model answers
+  Turn 3: [System prompt + Turn 1 + Turn 2 + Your message] → Model answers
+
+The entire conversation history is re-sent on every turn. The model is stateless — it has no memory between calls. 
+The "memory" lives in your application, not the model.
+
+
