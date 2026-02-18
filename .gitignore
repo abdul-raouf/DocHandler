@@ -10,3 +10,6 @@ pdfs/*
 chroma_db/
 debug_images/*
 debug_images.py
+excel_exports/*
+__pycache__/exportDataToExcel.cpython-311.pyc
+diagnose_page.py
